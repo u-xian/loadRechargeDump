@@ -70,11 +70,7 @@ python3 -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 6. Copy the RechargeDump file (s) in a folder named dumps (currently there is one for demo)
-
-```
-\c recharge_db
-```
+### 6. Copy the RechargeDump csv file (s) in a folder named dumps (currently there is one for demo)
 
 ### 7. Run the pipeline
 
