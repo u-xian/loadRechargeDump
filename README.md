@@ -50,14 +50,34 @@ CREATE TABLE recharge_dump_raw (
 
 > All data in this project is fictional and randomly generated.
 
-2.  copy this repo on your Linux distro
+### 2. Copy this repo on your Linux distro
 
-3.  Enter the repo
+### 4. Enter the repo
 
-4.  Create Python environment : python3 -m venv .venv
+```
+cd loadRechargeDump
+```
 
-5.  Install dependencies : pip install -r requirements.txt
+### 4. Create Python environment
 
-6.  copy the RechargeDump file (s) in a folder named dumps (currently there is one for demo)
+```
+python3 -m venv .venv
+```
 
-7.  Run the pipeline : python loadingFile.py
+### 5. Install dependencies
+
+```
+pip install -r requirements.txt
+```
+
+### 6. Copy the RechargeDump file (s) in a folder named dumps (currently there is one for demo)
+
+```
+\c recharge_db
+```
+
+### 7. Run the pipeline
+
+```
+python loadingFile.py
+```
