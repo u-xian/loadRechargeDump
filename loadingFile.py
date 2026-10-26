@@ -1,14 +1,18 @@
 """
 Load recharge dump CSV files into the database.
 
-For every *.csv in DIR_DUMPS (one transaction per file):
+For every *.csv in DIR_DUMPS:
+    0. check recharge_dump_load_log: if the file already has a LOAD SUCCESSFUL
+       row it is NOT loaded again -> moved to DIR_ARCHIVE/duplicates/
+    then, in one transaction:
     1. insert a row in recharge_dump_load_log            -> log_id
     2. insert the CSV rows in recharge_dump_raw          (file_id = log_id,
                                                           file_row_no = 1..n)
     3. read back (recharge_id, file_row_no) for that file_id
     4. explode BALANCES_INFO into recharge_dump_balances (recharge_id from 3.)
-If anything fails the transaction is rolled back and a LOAD FAILED row is
-written to the log table instead.
+    5. on success the file is moved to DIR_ARCHIVE/
+If anything fails the transaction is rolled back, a LOAD FAILED row is
+written to the log table and the file stays in DIR_DUMPS to be fixed/re-run.
 
 Schema is created with alembic (alembic upgrade head). The code only uses
 generic SQL / SQLAlchemy Core, so it runs unchanged on PostgreSQL, Oracle,
@@ -17,6 +21,8 @@ SQL Server, MySQL, SQLite ... (select the DBMS with DB_DRIVER in .env).
 import os
 import re
 import csv
+import shutil
+from datetime import datetime
 from io import StringIO
 
 import pandas as pd
@@ -30,6 +36,8 @@ log_table = os.getenv('DB_LOG_TABLE', 'recharge_dump_load_log')
 balances_table = os.getenv('DB_BALANCES_TABLE', 'recharge_dump_balances')
 
 csv_directory = os.path.join(BASE_DIR, os.getenv('DIR_DUMPS', 'dumps'))
+archive_directory = os.path.join(BASE_DIR, os.getenv('DIR_ARCHIVE', 'archive'))
+duplicates_directory = os.path.join(archive_directory, 'duplicates')
 
 # Columns that must be kept as text (leading zeros / 16-digit numbers would be
 # mangled if pandas inferred them as float).
@@ -182,6 +190,26 @@ def fetch_recharge_ids(conn, log_id):
 
 
 # --------------------------------------------------------------------------- #
+# archiving
+# --------------------------------------------------------------------------- #
+def archive_file(file_name, target_directory):
+    """
+    Move dumps/<file_name> into target_directory. If a file with the same name
+    is already there, a timestamp is appended so nothing is ever overwritten.
+    Returns the final path.
+    """
+    os.makedirs(target_directory, exist_ok=True)
+    src = os.path.join(csv_directory, file_name)
+    dst = os.path.join(target_directory, file_name)
+    if os.path.exists(dst):
+        stem, ext = os.path.splitext(file_name)
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        dst = os.path.join(target_directory, f'{stem}_{stamp}{ext}')
+    shutil.move(src, dst)
+    return dst
+
+
+# --------------------------------------------------------------------------- #
 # main load
 # --------------------------------------------------------------------------- #
 def load_file(file_name):
@@ -228,14 +256,38 @@ def load_file(file_name):
         return False
 
 
+def process_file(file_name):
+    """
+    Full lifecycle of one dump file:
+      1. duplicate check against the log table
+      2. load
+      3. archive (success -> archive/, duplicate -> archive/duplicates/,
+                  failure -> file is left in dumps/)
+    """
+    # 1. already loaded? -> never load twice
+    if already_loaded(file_name):
+        dst = archive_file(file_name, duplicates_directory)
+        print(f"[SKIPPED] {file_name}: already loaded successfully "
+              f"-> moved to {os.path.relpath(dst, BASE_DIR)}")
+        return
+
+    # 2. load
+    loaded = load_file(file_name)
+
+    # 3. archive only what was committed
+    if loaded:
+        dst = archive_file(file_name, archive_directory)
+        print(f"[ARCHIVED] {file_name} -> {os.path.relpath(dst, BASE_DIR)}")
+    else:
+        print(f"[KEPT]    {file_name}: left in {os.path.relpath(csv_directory, BASE_DIR)}/ for correction")
+
+
 if __name__ == '__main__':
+    os.makedirs(csv_directory, exist_ok=True)
     csv_files = sorted(f for f in os.listdir(csv_directory) if f.lower().endswith('.csv'))
 
     if not csv_files:
         print(f"No CSV files found in {csv_directory}")
 
     for file in csv_files:
-        if already_loaded(file):
-            print(f"[SKIPPED] {file}: already loaded successfully")
-            continue
-        load_file(file)
+        process_file(file)
