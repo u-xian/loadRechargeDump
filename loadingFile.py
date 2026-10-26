@@ -1,28 +1,40 @@
+"""
+Load recharge dump CSV files into the database.
+
+For every *.csv in DIR_DUMPS (one transaction per file):
+    1. insert a row in recharge_dump_load_log            -> log_id
+    2. insert the CSV rows in recharge_dump_raw          (file_id = log_id,
+                                                          file_row_no = 1..n)
+    3. read back (recharge_id, file_row_no) for that file_id
+    4. explode BALANCES_INFO into recharge_dump_balances (recharge_id from 3.)
+If anything fails the transaction is rolled back and a LOAD FAILED row is
+written to the log table instead.
+
+Schema is created with alembic (alembic upgrade head). The code only uses
+generic SQL / SQLAlchemy Core, so it runs unchanged on PostgreSQL, Oracle,
+SQL Server, MySQL, SQLite ... (select the DBMS with DB_DRIVER in .env).
+"""
 import os
 import re
 import csv
-from pathlib import Path
 from io import StringIO
 
 import pandas as pd
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import URL
-from dotenv import load_dotenv
+import sqlalchemy as sa
+from sqlalchemy import text
 
-load_dotenv()
+from db import BASE_DIR, get_engine
 
-BASE_DIR = Path(__file__).resolve().parent
+db_table = os.getenv('DB_TABLE', 'recharge_dump_raw')
+log_table = os.getenv('DB_LOG_TABLE', 'recharge_dump_load_log')
+balances_table = os.getenv('DB_BALANCES_TABLE', 'recharge_dump_balances')
 
-db_table = os.getenv('DB_TABLE')                                       # e.g. recharge_dump_raw
-db_table_pk = os.getenv('DB_TABLE_PK', 'recharge_id')                  # primary key of db_table
-log_table = os.getenv('DB_LOG_TABLE', 'recharge_dump_load_log')        # load log table
-balances_table = os.getenv('DB_BALANCES_TABLE', 'recharge_dump_balances')  # exploded balances_info
-
-csv_directory = os.path.join(BASE_DIR, os.getenv('DIR_DUMPS'))
+csv_directory = os.path.join(BASE_DIR, os.getenv('DIR_DUMPS', 'dumps'))
 
 # Columns that must be kept as text (leading zeros / 16-digit numbers would be
 # mangled if pandas inferred them as float).
 STRING_COLUMNS = {
+    'SUBSCRIBER_ID': str,
     'CARD_NUMBER': str,
     'SERIAL_NUMBER': str,
     'BATCH_NUMBER': str,
@@ -35,21 +47,27 @@ BALANCE_BRACKET_RE = re.compile(r'\[([^\]]*)\]')
 STATUS_SUCCESS = 'LOAD SUCCESSFUL'
 STATUS_FAILED = 'LOAD FAILED'
 
-connection_url = URL.create(
-    "postgresql+psycopg2",
-    username=os.getenv("DB_USERNAME"),
-    password=os.getenv("DB_PASSWORD"),
-    host=os.getenv("DB_HOST"),
-    port=int(os.getenv("DB_PORT", 5432)),
-    database=os.getenv("DB_NAME"),
+db = get_engine()
+
+# Minimal Core definition of the log table: lets SQLAlchemy fetch the
+# generated log_id in the way each DBMS supports (RETURNING / OUTPUT /
+# lastrowid / RETURNING INTO) instead of hand-written dialect SQL.
+_metadata = sa.MetaData()
+LOG_TABLE = sa.Table(
+    log_table, _metadata,
+    sa.Column('log_id', sa.BigInteger, primary_key=True),
+    sa.Column('file_name', sa.String(255)),
+    sa.Column('total_records', sa.Integer),
+    sa.Column('status', sa.String(20)),
+    sa.Column('error_message', sa.Text),
 )
 
-# Create a database engine
-db = create_engine(connection_url)
 
-
+# --------------------------------------------------------------------------- #
+# bulk insert
+# --------------------------------------------------------------------------- #
 def psql_insert_copy(table, conn, keys, data_iter):
-    """pandas.to_sql 'method' that uses PostgreSQL COPY for fast bulk insert."""
+    """PostgreSQL-only fast path: pandas.to_sql 'method' using COPY."""
     dbapi_conn = conn.connection
     with dbapi_conn.cursor() as cur:
         buf = StringIO()
@@ -60,40 +78,76 @@ def psql_insert_copy(table, conn, keys, data_iter):
         cur.copy_expert(f'COPY {table_name} ({columns}) FROM STDIN WITH CSV', buf)
 
 
+def bulk_insert(df, table_name, conn):
+    """Append a DataFrame to a table using the fastest portable method."""
+    if conn.dialect.name == 'postgresql':
+        method = psql_insert_copy
+    else:
+        method = None          # standard executemany (fast_executemany on mssql)
+    df.to_sql(table_name, con=conn, if_exists='append', index=False,
+              chunksize=1000, method=method)
+
+
+# --------------------------------------------------------------------------- #
+# log table helpers
+# --------------------------------------------------------------------------- #
 def already_loaded(file_name):
     """True if this file already has a LOAD SUCCESSFUL entry in the log table."""
     sql = text(f"""
         SELECT 1 FROM {log_table}
         WHERE file_name = :file_name AND status = :status
-        LIMIT 1
     """)
     with db.connect() as conn:
         row = conn.execute(sql, {'file_name': file_name, 'status': STATUS_SUCCESS}).first()
     return row is not None
 
 
+def insert_log_row(conn, file_name, total_records, status, error_message=None):
+    """Insert a log row and return its generated log_id (portable)."""
+    result = conn.execute(
+        sa.insert(LOG_TABLE).values(
+            file_name=file_name,
+            total_records=total_records,
+            status=status,
+            error_message=error_message,
+        )
+    )
+    return result.inserted_primary_key[0]
+
+
 def log_failure(file_name, total_records, error):
     """Write a LOAD FAILED row to the log table (own transaction)."""
-    sql = text(f"""
-        INSERT INTO {log_table} (file_name, total_records, status, error_message)
-        VALUES (:file_name, :total_records, :status, :error_message)
-    """)
     with db.begin() as conn:
-        conn.execute(sql, {
-            'file_name': file_name,
-            'total_records': total_records,
-            'status': STATUS_FAILED,
-            'error_message': str(error)[:4000],
-        })
+        insert_log_row(conn, file_name, total_records, STATUS_FAILED,
+                       error_message=str(error)[:4000])
 
 
-def explode_balances_info(recharge_ids, balances_info_series):
+# --------------------------------------------------------------------------- #
+# transformations
+# --------------------------------------------------------------------------- #
+def prepare_raw_frame(df, log_id):
+    """Lower-case columns, typed dates, file_id / file_row_no, no balances_info."""
+    df = df.copy()
+    df.columns = df.columns.str.strip().str.lower()
+
+    # Real datetime/date objects so every DB driver binds them correctly
+    # (Oracle / SQL Server do not reliably cast strings to DATE/DATETIME).
+    df['recharge_date_time'] = pd.to_datetime(df['recharge_date_time'])
+    if 'filedate' in df.columns:
+        df['filedate'] = pd.to_datetime(df['filedate']).dt.date
+
+    df['file_id'] = log_id
+    df['file_row_no'] = range(1, len(df) + 1)
+    return df
+
+
+def explode_balances_info(file_row_nos, balances_info_series):
     """
     Turn the packed BALANCES_INFO column into a tidy DataFrame:
-    one row per bracket, linked back to recharge_dump_raw via recharge_id.
+    one row per bracket, keyed by file_row_no (mapped to recharge_id later).
     """
     records = []
-    for recharge_id, packed in zip(recharge_ids, balances_info_series):
+    for row_no, packed in zip(file_row_nos, balances_info_series):
         if pd.isna(packed):
             continue
         for bracket in BALANCE_BRACKET_RE.findall(packed):
@@ -102,33 +156,34 @@ def explode_balances_info(recharge_ids, balances_info_series):
             amount = parts[1]
             delta = parts[2]
             expiry_raw = parts[3] if len(parts) > 3 else None
-            records.append((recharge_id, balance_id, amount, delta, expiry_raw))
+            records.append((row_no, balance_id, amount, delta, expiry_raw))
 
     balances_df = pd.DataFrame(
         records,
-        columns=['recharge_id', 'balance_id', 'balance_amount', 'balance_delta', 'expiry_date'],
+        columns=['file_row_no', 'balance_id', 'balance_amount', 'balance_delta', 'expiry_date'],
     )
     if not balances_df.empty:
+        balances_df['balance_id'] = balances_df['balance_id'].astype(int)
+        balances_df['balance_amount'] = pd.to_numeric(balances_df['balance_amount'])
+        balances_df['balance_delta'] = pd.to_numeric(balances_df['balance_delta'])
         balances_df['expiry_date'] = pd.to_datetime(
             balances_df['expiry_date'], format='%Y%m%d%H%M%S', errors='coerce'
         )
     return balances_df
 
 
-def get_pk_sequence(conn, table, column):
-    """Resolve the sequence backing an identity/serial primary key column."""
-    seq = conn.execute(
-        text("SELECT pg_get_serial_sequence(:table, :column)"),
-        {'table': table, 'column': column},
-    ).scalar_one_or_none()
-    if not seq:
-        raise RuntimeError(
-            f"Could not resolve the identity sequence for {table}.{column}. "
-            f"Has SQL_queries/03_enable_explicit_recharge_id.sql been applied?"
-        )
-    return seq
+def fetch_recharge_ids(conn, log_id):
+    """{file_row_no: recharge_id} for every raw row of this file (portable)."""
+    rows = conn.execute(
+        text(f"SELECT recharge_id, file_row_no FROM {db_table} WHERE file_id = :file_id"),
+        {'file_id': log_id},
+    ).all()
+    return {row_no: recharge_id for recharge_id, row_no in rows}
 
 
+# --------------------------------------------------------------------------- #
+# main load
+# --------------------------------------------------------------------------- #
 def load_file(file_name):
     """
     Load one CSV into db_table / balances_table. The log row and the data rows
@@ -139,45 +194,27 @@ def load_file(file_name):
     total_records = 0
 
     try:
-        # Read the CSV file into a pandas DataFrame
         df = pd.read_csv(file_path, dtype=STRING_COLUMNS)
-        df.columns = df.columns.str.strip().str.lower()
         total_records = len(df)
 
         with db.begin() as conn:
-            # 1. create the log row and get its id
-            log_id = conn.execute(
-                text(f"""
-                    INSERT INTO {log_table} (file_name, total_records, status)
-                    VALUES (:file_name, :total_records, :status)
-                    RETURNING log_id
-                """),
-                {'file_name': file_name, 'total_records': total_records, 'status': STATUS_SUCCESS},
-            ).scalar_one()
+            # 1. log row -> log_id
+            log_id = insert_log_row(conn, file_name, total_records, STATUS_SUCCESS)
 
-            # 2. reserve one recharge_dump_raw.recharge_id per row up-front so
-            #    the same ids can be used to link the exploded balances rows
-            #    below (requires recharge_id to be GENERATED BY DEFAULT, see
-            #    sql/03_enable_explicit_recharge_id.sql).
-            pk_sequence = get_pk_sequence(conn, db_table, db_table_pk)
-            recharge_ids = conn.execute(
-                text(f"SELECT nextval('{pk_sequence}') FROM generate_series(1, :n)"),
-                {'n': total_records},
-            ).scalars().all()
-            df[db_table_pk] = recharge_ids
-            df['file_id'] = log_id
+            # 2. raw rows (balances_info is split off and not stored here)
+            raw_df = prepare_raw_frame(df, log_id)
+            balances_df = explode_balances_info(raw_df['file_row_no'], raw_df['balances_info'])
+            raw_df = raw_df.drop(columns=['balances_info'])
+            bulk_insert(raw_df, db_table, conn)
 
-            # 3. split balances_info out into its own tidy frame, then drop it
-            #    from the row that goes into recharge_dump_raw.
-            balances_df = explode_balances_info(df[db_table_pk], df['balances_info'])
-            df = df.drop(columns=['balances_info'])
+            # 3. recharge_id generated by the DB for each file_row_no
+            id_map = fetch_recharge_ids(conn, log_id)
 
-            # 4. bulk-load both tables (same transaction)
-            df.to_sql(db_table, con=conn, if_exists='append', index=False,
-                      chunksize=1000, method=psql_insert_copy)
+            # 4. balances rows, linked through recharge_id
             if not balances_df.empty:
-                balances_df.to_sql(balances_table, con=conn, if_exists='append', index=False,
-                                    chunksize=1000, method=psql_insert_copy)
+                balances_df['recharge_id'] = balances_df['file_row_no'].map(id_map)
+                balances_df = balances_df.drop(columns=['file_row_no'])
+                bulk_insert(balances_df, balances_table, conn)
 
         print(f"[OK]      {file_name}: {total_records} rows loaded "
               f"({len(balances_df)} balance entries, log_id={log_id})")
@@ -186,12 +223,12 @@ def load_file(file_name):
     except Exception as exc:
         # transaction above has been rolled back -> no partial data, no log row
         log_failure(file_name, total_records, exc)
-        print(f"[FAILED]  {file_name}: {exc}")
+        first_line = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        print(f"[FAILED]  {file_name}: {first_line}")
         return False
 
 
 if __name__ == '__main__':
-    # Get a list of CSV files in the specified directory
     csv_files = sorted(f for f in os.listdir(csv_directory) if f.lower().endswith('.csv'))
 
     if not csv_files:
