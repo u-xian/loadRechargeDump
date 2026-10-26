@@ -1,16 +1,19 @@
+import os
 import pandas as pd
 import csv
+from pathlib import Path
 from io import StringIO
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
-import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
+BASE_DIR = Path(__file__).resolve().parent
+
 db_table = os.getenv('DB_TABLE')
 
-csv_directory = os.getenv('DIR_PATH')
+csv_directory = os.path.join(BASE_DIR, os.getenv('DIR_PATH'))
 
 connection_url = URL.create(
       "postgresql+psycopg2",
@@ -23,9 +26,6 @@ connection_url = URL.create(
 
 # Create a database engine 
 db = create_engine(connection_url)
-
-# Establish a connection to the PostgreSQL database
-conn = db.connect()
 
 def psql_insert_copy(table, conn, keys, data_iter):
     dbapi_conn = conn.connection
@@ -44,7 +44,7 @@ csv_files = [file for file in os.listdir(csv_directory) if file.endswith('.csv')
 # Iterate through each CSV file and load it into PostgreSQL without table creation
 for file in csv_files:
     # Read the CSV file into a pandas DataFrame
-    df = pd.read_csv(csv_directory + file)
+    df = pd.read_csv(   os.path.join(csv_directory, file))
 
     df.columns = df.columns.str.strip().str.lower()
 
