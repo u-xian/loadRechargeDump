@@ -1,3 +1,4 @@
 .venv/
 .env
 recharge_dump_raw.sql
+SQL_queries/
